@@ -1,0 +1,2288 @@
+---
+title: "Project"
+author: "Beryl"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+     keep_tex: true
+     latex_engine: xelatex
+geometry: top=0.3in, bottom=0.3in, left=0.3in, right=0.3in  
+fontsize: 6pt  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include=TRUE,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.path = "plots/",
+                      fig.keep = "all",
+                      fig.width = 7.5,   
+                      fig.height = 5.5,  
+                      fig.pos = 'H', # place figures here
+                      dpi = 120)
+```
+
+
+
+```{r usedLibs}
+
+library(dplyr)  # Relevant needed libraries
+library(DescTools)  # For winsorizing scal_score - removal of outliers
+library(gbm)   # Grad Boost Method
+library(caret)   # Used in GB Winsor model 
+library(dplyr)   # Used in GB Winsor Model
+```
+
+#### Read Required Datasets(6)
+```{r readDatasets, include=FALSE}
+
+# Define base data folder once
+data_dir <- "601 PROJECT DATA/OULAD_DATA"
+
+# Read files using file.path()
+studInfo <- read.csv(file.path(data_dir, "studInfo.csv"),
+                        header = TRUE, stringsAsFactors = FALSE)
+
+studReg <- read.csv(file.path(data_dir, "studReg.csv"),
+                        header = TRUE, stringsAsFactors = FALSE)
+
+studVle <- read.csv(file.path(data_dir, "studVle.csv"),
+                    header = TRUE, stringsAsFactors = FALSE)
+
+vle <- read.csv(file.path(data_dir, "vle.csv"),
+                header = TRUE, stringsAsFactors = FALSE)
+
+studAssess <- read.csv(file.path(data_dir, "studAssess.csv"),
+                    header = TRUE, stringsAsFactors = FALSE)
+
+assess <- read.csv(file.path(data_dir, "assess.csv"),
+                header = TRUE, stringsAsFactors = FALSE)
+```
+
+
+#### Removal of Withdrawn Students
+```{r}
+studInfo_All <- studInfo  # Make copy of orig studInfo file
+studInfo <- subset(studInfo, final_result != "Withdrawn")
+```
+
+#### Renaming of Cols - studInfo
+```{r renStudInfo, include=FALSE}
+studInfo <- studInfo %>%
+  rename(code_mode = code_module,   # code_mode (left) replaces code_module (right), etc
+         code_pres = code_presentation,
+         id_stud = id_student)
+```
+
+
+#### Renaming of Cols - studRegistration
+```{r renRegis, include=FALSE}
+studReg <- studReg %>%
+  rename(code_mode = code_module,
+         code_pres = code_presentation,
+         id_stud = id_student,
+         date_reg = date_registration)
+```
+
+
+#### Renaming of Cols - studVle (daily click logs)
+```{r renStudvle, include=FALSE}
+studVle <- studVle %>%
+  rename(code_mode = code_module,
+         code_pres = code_presentation,
+         id_stud = id_student)
+```
+
+#### Renaming of Cols - Vle (Metadata on VLE materials - Resource type: forum, quiz, wiki, reading
+```{r renVle, include=FALSE}
+Vle <- vle %>%
+  rename(code_mode = code_module,
+         code_pres = code_presentation,
+         activity = activity_type)
+```
+
+#### Renaming of Cols - studAssess( Info on whether students registered, withdrew, or completed course)
+```{r renStudAssess, include=FALSE}
+studAssess <- studAssess %>%
+  rename(id_assess = id_assessment,
+         dte_sub = date_submitted,
+         id_stud = id_student)
+```
+
+
+#### Renaming of Cols - Assessment (Details of assessment structure (weight, deadline, type: exam, TMA, CMA, etc))
+```{r renAssess, include=FALSE}
+assess <- assess %>%
+  rename(id_assess = id_assessment,
+         code_mode = code_module,
+         code_pres = code_presentation,
+         assess_type = assessment_type)
+```
+
+
+#### View of structure of studVle (largest table - contains daily counts of clicks per student)
+```{r}
+head(studVle)
+str(studVle)
+```
+
+
+#### Table Keys Identification/Setup 
+```{r keySetup}
+# For engagement tables
+eng_keys <- c("id_site", "code_mode", "code_pres")
+
+# For assessment tables
+assess_keys <- c("id_assess")
+
+# For student-level tables
+stud_keys <- c("id_stud", "code_mode", "code_pres")
+```
+
+#### Check for Missing Values in Keys
+```{r funMissVals}
+# Function to check missing values in specific columns
+check_na <- function(df, keys) {
+  existing_keys <- intersect(keys, names(df)) #only keep cols that exist
+  if (length(existing_keys) == 0) return(NA) #no keys exist, return NA
+  colSums(is.na(df[existing_keys]))  # Counts non-NA columns keys
+}
+```
+
+#### Definition of Table List (for which to key)
+```{r}
+tables <- list(
+  studVle = studVle,
+  vle = vle,
+  studReg = studReg,
+  studInfo = studInfo,
+  assess = assess,
+  studAssess = studAssess
+)
+```
+
+
+```{r}
+colnames(studVle)
+```
+
+```{r}
+colnames(Vle)
+```
+
+#### Assign keys to tables
+```{r setTabKeys}
+# Define keys per table
+table_keys <- list(
+  studVle = eng_keys,
+  vle = eng_keys,
+  studReg = stud_keys,
+  studInfo = stud_keys,
+  assess = assess_keys,
+  studAssess = assess_keys
+)
+
+# function check_na() on each table in the list tables, using corresponding key from table_keys.
+na_results <- lapply(names(tables), function(tbl_name) {
+  check_na(tables[[tbl_name]], table_keys[[tbl_name]])
+})
+names(na_results) <- names(tables)
+
+# View results
+na_results
+```
+
+#### Sampling 10% dataset from studInfo table
+```{r sampStudInfo}
+
+set.seed(123)   # Used for reproducibility
+sample_ids <- sample(studInfo$id_stud, size = 0.1 * nrow(studInfo))
+stud_sample <- subset(studInfo,id_stud %in% sample_ids)
+```
+
+
+```{r chkSampRes}
+numData <- length(unique(stud_sample$id_stud))  #Get number of unique stud id
+numData
+```
+
+#### Merge StudInfo with studRegistration
+```{r mrgStudInfo_Reg}
+studInfo_Reg <- merge(studInfo, studReg, 
+                  by = "id_stud", all.x = TRUE)
+```
+
+
+#### Check length of first merge
+```{r chkMrgCnt}
+numData <- length(unique(studInfo_Reg$id_stud))
+numData
+```
+
+#### Merge studVle with Vle
+```{r mrgStudInfo_Reg}
+vle_join <- merge(studVle, vle, by = "id_site", all.x = TRUE)
+
+# Only keep student click activity if student also in studInfo_Reg merged table
+vle_sample <- subset(vle_join, id_stud %in% studInfo_Reg$id_stud)
+```
+
+
+```{ chkMrgCnt_2}
+numData <- length(unique(vle_sample$id_stud))
+numData
+head(vle_sample)
+str(vle_sample)
+```
+
+
+```{r include=FALSE}
+colnames(vle_sample)
+```
+
+#### Merge studAssess with Assess
+```{r mrgStudInfo_Reg2}
+assess_join <- merge(studAssess, assess, 
+                         by = "id_assess", all.x = TRUE)
+
+# Only keep student assess if student also in studInfo_Reg merged table
+assess_sample <- subset(assess_join, id_stud %in%                                                    studInfo_Reg$id_stud)
+```
+
+
+#### Verification Check of Dataset
+```{r chkVerDataSet}
+numData <- length(unique(assess_sample$id_stud))
+numData
+head(assess_sample)
+str(assess_sample)
+```
+
+
+```{r}
+str(vle_sample)
+```
+
+#### Merge ALL sub datasets
+```{r mrgStudInfo_Reg}
+
+# Aggregated VLE (sum) stats before merge
+vle_agg <- aggregate(sum_click ~ id_stud, data = vle_sample, sum)
+mergedAll <- merge(studInfo_Reg, vle_agg, by = "id_stud", all.x = TRUE)
+```
+
+
+```{r}
+colnames(mergedAll)
+```
+
+
+#### Output Merged Tables before EDA - Proj Stage 3
+```{r writeOutFile-1}
+
+mergeCopy <- mergedAll   #Make Copy of merge dataset as fallback logistic
+
+output_file <- "proj_Data_1.csv"  # 1st shared proj file (no data cleaning) 
+
+if (!file.exists(output_file)) {
+  write.csv(mergeCopy, output_file, row.names = FALSE)
+  message("File written successfully.")
+} else {
+  write.csv(mergeCopy, output_file, row.names = FALSE)
+  message("File already existed, but has been overwritten.")}
+```
+
+## PROJ EXPLORATORY DATA ANALYSIS - STAGE
+
+#### Examine structure of Merged Dataset (MergedALL)
+```{r}
+str(mergedAll)
+```
+
+#### Explore Structure of Score variable - for possible EDA
+```{r}
+str(assess_sample$score)
+summary(assess_sample$score)
+```
+
+#### Clean Scores - Replace NA with Median
+```{r}
+
+# Convert safely: factor → character → numeric
+assess_sample$score <- as.numeric(as.character(assess_sample$score))
+assess_sample$score_num
+
+# Count how many scores not converted (became NA but not originally NA)
+num_failed <- sum(is.na(assess_sample$score) & !is.na(assess_sample$score))
+
+print(paste("number failed: ", num_failed))
+
+# Replace NAs with median value - score distrib negatively skewed
+assess_sample$score[is.na(assess_sample$score)] <- median(assess_sample$score, na.rm = TRUE)
+
+# table(assess_sample$score_flag)
+```
+
+
+```{r reChckSummry}
+str(assess_sample$score)
+summary(assess_sample$score)
+```
+
+#### Merge Assessment data into merged Dataset
+```{r}
+# Aggreg per student assessment scores by mean
+assess_agg <- aggregate(score ~ id_stud, data = assess_sample, mean)
+
+data <- merge(mergedAll, assess_agg, by = "id_stud", all.x = TRUE)
+head(data)
+```
+
+#### Inspection of FULLY Merged Dataset (DATA)
+```{r totRecs_data}
+
+numData <- length(unique(data$id_stud))  # unique students
+numData
+```
+
+ 
+```{r strCleanScore}
+str(data)
+```
+
+#### Get number of Duplicated Student IDs
+```{r chkNumDupl}
+
+numDups <- sum(duplicated(data$id_stud))
+numDups
+```
+
+
+```{r displaySampSub}
+
+data[sample(nrow(data), 15), ]   #View first 15 records
+```
+
+
+#### Keep Highest Student Score for students with Multiple Scores
+```{r}
+
+# Get max score for each stud with multiple records
+data <- data %>%
+  group_by(id_stud) %>%
+  slice_max(score, with_ties = FALSE) %>%
+  ungroup()
+```
+
+
+#### Remove Unwanted/Duplicated Columns: mode.y, cod_pres.y
+```{r remCols}
+data <- subset(data, select = -c(code_mode.y, code_pres.y))
+head(data, 10)
+```
+
+
+#### Variables for FACTOR Conversion (gender, finRes)
+```{r varFactConv}
+
+# analysis can only be of numeric form; perform factor conversion of variables
+data$gender <- factor(data$gender)
+data$finRes <- factor(data$final_result, 
+                         levels = c("Fail","Pass","Distinct"))
+```
+
+
+#### Variables for ORDINAL Conversion (imd_band, age_band)
+```{r varOrdConv}
+
+# imd_band from least to most deprived
+data$imd_band <- factor(data$imd_band,
+                   levels = c("0-10%", "10-20%", "20-30%", "30-40%",                      "40-50%", "50-60%", "60-70%", "70-80%",                              "80-90%", "90-100%"))
+
+# age_band from youngest to oldest
+data$age_band <- factor(data$age_band,
+                   levels = c("0-35", "35-44", "45-54", "55<="),
+                        ordered=TRUE)
+```
+
+
+#### Invalid Chars Replacement: NAs, ?, Etc
+```{r varInvalChars}
+data$sum_click[is.na(data$sum_click)] <- 0
+
+data$score[is.na(data$score)] <- -1
+
+data$date_unregistration[data$date_unregistration == "?"] <- NA
+```
+
+
+#### Date Conversions to Numeric: date_reg, date_unregistration
+```{r varDateConv}
+
+data$date_reg <- as.numeric(data$date_reg)
+
+data$date_unregistration <- as.numeric(data$date_unregistration)
+```
+
+
+#### Scaling & Rounding of Num Variables for Further Analysis 
+```{r varScalNum}
+
+data_SoFar <- data # Retain copy of data before changes
+data$scal_sum_click <- round(scale(data$sum_click),2)
+data$scal_studied_credits <- round(scale(data$studied_credits),2)
+data$scal_scoreR <- round(scale(data$score),2)
+```
+
+#### Check for Imbalance Gender Values
+```{r varGendChck}
+
+# Replace any other values with NA
+data$gender[!data$gender %in% c("M", "F")] <- NA
+genCnt <- table(data$gender)  # check counts
+genCnt
+```
+
+
+#### Consistency Check: Vaildation of SCORE (1-100)
+```{r varScoreVal}
+data$score[!(data$score >= 0 & data$score <= 100)] <- NA
+```
+
+
+#### Check for Duplication: Different FinalResult for same Student
+```{r varDuplChck}
+
+dup_finRes <- data %>%
+  group_by(id_stud) %>%
+  summarize(unique_results = n_distinct(final_result)) %>%
+  filter(unique_results > 1)
+
+#dup_finRes # displays students with multiple conflicting results
+```
+
+
+```{r totRecs_data}
+
+dup_finRes
+```
+
+
+```{r}
+colnames(data)
+```
+
+
+#### Drop Unneccesary Columns (id_stud, date_unreg)
+```{r colsRemove}
+
+# Remove id_stud, date_unreg not relevant for further analysis
+data <- data %>%
+  select(-id_stud, -date_unregistration)
+```
+
+
+#### Data Encoding - Nominal Variables (gender, region, disability, fin_res)
+```{r dtaEncode}
+#Create dummy vars safely with intercept to drop 1 level per factor)
+
+encodDta <- model.matrix(~ gender + region + disability + final_result, data = data)
+
+# Convert to dataframe and drop intercept col
+encodDta <- as.data.frame(encodDta[, -1])
+
+# Recombine encoded dummies with numeric variables
+dataEncode <- cbind(data, encodDta)
+data <- cbind(data, encodDta)  # ReInstate encoded variable with 'data' file
+head(data, 5)
+```
+
+
+#### Cleanup Colnames Containing Variation of word 'Region'
+```{r renLongRegions}
+
+# Trim spaces
+names(data) <- trimws(names(data))
+
+# Remove duplicate columns but keep first occurrence
+data <- data[, !duplicated(names(data))]
+
+# Rename region columns and remove trailing 'Region'
+names(data) <- names(data) %>%
+  sub("^region", "reg", .) %>%         # prefix 'region' -> 'reg'
+  sub("\\s*Region\\s*$", "", .) %>%    # remove 'Region' at end + spaces
+  gsub(" ", "_", .)                    # replace remaining spaces with '_'
+
+# Ensure uniqueness after renaming
+names(data) <- make.unique(names(data))
+```
+
+
+```{r}
+colnames(data)
+#data$reg
+```
+
+#### Renaming of Column Vars
+```{r colOutRename}
+
+data <- data %>%
+  rename(
+    code_mode = code_mode.x,
+    code_pres = code_pres.x,
+    high_educ = highest_education,
+    prev_attempts = num_of_prev_attempts,
+    study_credits = studied_credits,
+    #date_unreg = date_unregistration,
+    scal_click = scal_sum_click,
+    scal_credits = scal_studied_credits,
+    scal_score = scal_scoreR,
+    fin_ResPass = final_resultPass,
+    fin_ResFail = final_resultFail
+      )
+```
+
+
+#### Display of Clean Colnames
+```{r dispCleanNames}
+colnames(data)
+```
+
+
+#### Handling Categorical Missing Values
+```{r varCatagor}
+
+# Replace NA in age_band, imd_band with the most common category
+mode_age <- names(sort(table(data$age_band), decreasing = TRUE))[1]
+data$age_band[is.na(data$age_band)] <- mode_age
+
+mode_imdBand <- names(sort(table(data$imd_band), decreasing = TRUE))[1]
+data$imd_band[is.na(data$imd_band)] <- mode_imdBand
+```
+
+
+#### Imputation of Score with Median Value
+```{r varScoreRepl}
+
+# Score is not symmetric - best to use median
+median_score <- median(data$score, na.rm = TRUE)
+data$score[is.na(data$score)] <- median_score
+```
+
+
+#### Fig 1. Histogram - Plots of Distributions' Spread, Skewness, Outliers
+```{r histPlots}
+
+# Set 2x2 plotting layout
+par(mfrow = c(2, 2))
+
+# Histograms for key numeric variables
+hist(data$sum_click, main = "Distribution of LMS Clicks", xlab = "Unscaled sum_clicks", col = "lightblue"); box(lwd = 2)
+hist(data$score, main = "Distribution of Scores", xlab = "Unscaled score", col = "lightgreen"); box(lwd = 2)
+hist(data$prev_attempts, main = "Distribution of Prior Attempts", xlab = "Unscaled prev_attempts", col = "lightpink"); box(lwd = 2)
+hist(data$study_credits, main = "Distribution of Study Credits", xlab = "Unscaled study_credits", col = "lightyellow"); box(lwd = 2)
+
+# Reset layout
+par(mfrow = c(1, 1))
+```
+
+#### ANALYSIS:
+- sum_click: Right-skewed — most students have low-to-moderate LMS activity, few with very high engagement.
+
+- score: Roughly symmetric — grades spread fairly evenly, suggesting no strong skew in performance.
+
+- prev_attempts: Highly concentrated at 0–1 — most students are first-time takers.
+
+- study_credits: Slight right-skew — most students enroll in moderate credit loads, fewer in very high ones.
+
+
+#### Transformation of sum_clicks, study_credits
+```{r varLogTrans}
+
+# Log-transform sum_click (add 1 to handle zeros)
+data$logSum_click <- log1p(data$sum_click)
+data <- subset(data, select = -sum_click)
+
+data$logStudy_credits <- log1p(data$study_credits)
+data <- subset(data, select = -study_credits)
+```
+
+#### Fig 2: Log Transformed of Indep. Numerical Variables
+```{r varLogTransVerif}
+
+# summary(data[, c("logSum_click", "logStudy_credits")])
+
+# Quick check of transformation
+par(mfrow = c(1, 2))
+hist(data$logSum_click, main = "Log Transformed sum_click", xlab = "log(1 + LMS Clicks)", col = "lightgreen")
+hist(data$logStudy_credits, main = "Log Transformed study_credits", xlab = "log(1 + Study Credits)", col = "lightblue")
+par(mfrow = c(1, 1))
+
+# Add border around the entire plot
+box(lwd = 2, col = "black")
+```
+
+
+```{r include=TRUE}
+colnames(data)
+```
+
+#### Fig.3: SCATTERPLOT - Visualization of Numerical Variables
+```{r numVarVisual}
+
+# Select numeric variables
+num_vars <- data[, c("logSum_click", "score", "prev_attempts", "logStudy_credits")]
+
+# Pairs plot with bigger labels and main title
+pairs(num_vars,
+      main = "Scatterplot Matrix - Interlations of Key Numeric Variables",
+      pch = 16,
+      col = "blue",
+      cex.labels = 1.0,       # size of diagonal variable labels
+      cex.axis = 1.2)         # size of tick labels
+
+box(which = "figure", lwd = 2, col = "black")
+```
+
+**Interpretation:**
+- Interaction vs Score:  Clear positive, nonlinear trend is visible — higher LMS activity (log-transformed clicks) corresponds to higher scores, though the effect plateaus at upper score ranges. This supports the notion that engagement predicts performance, but with diminishing returns at very high interaction levels.
+
+- Prev. attempts vs. score:  The relationship is inversely clustered — students with multiple previous attempts generally show lower scores, reflecting cumulative difficulty or learning barriers for repeat takers.
+
+- Study_credits vs. score: No strong linear correlation is seen, though there is slight dispersion suggesting that students taking heavier credit loads may face modest performance variability — possibly due to workload balancing.
+
+Intercorrelations among predictors: 
+A. logSum_click and prev_attempts: Relations is weak or no correlation — activity level is largely independent of how many times the student has taken the course.
+
+B. logSum_click and logStudy_credits: mild positive association — students with more credits may interact more frequently with the LMS, perhaps reflecting greater academic engagement overall.
+
+C. prev_attempts and logStudy_credits: no clear pattern — course load appears unrelated to repetition history.
+
+
+```{r verLogSumClick}
+
+summary(data$logSum_click)
+sum(!is.finite(data$logSum_click))
+```
+
+```{r verScalScore}
+
+summary(data$scal_score)
+sum(!is.finite(data$scal_score))
+```
+```{r include=FALSE}
+sum(data$high_educ == "PostGrad", na.rm = TRUE)
+
+```
+
+
+#### Fig. 4: BOXPLOT LMS usage by Prior Education
+```{r varBoxPlot}
+
+data$high_educ <- factor(data$high_educ, exclude = NULL)  # keeps N
+
+# Reorder and relabel prior education levels
+data$high_educ <- factor(data$high_educ,
+                         levels = c("No Formal quals", "Lower Than A Level", 
+                                    "A Level or Equivalent", "HE Qualification", "Post Graduate"),
+                         labels = c("None", "Lower", "A-Level", "HE Qual", "PostGrad"))
+
+par(mar = c(7, 5, 4, 2) + 0.2)  # widen bottom margin
+
+# Redraw boxplot
+boxplot(logSum_click ~ high_educ, data = data,
+        main = "LMS Usage by Prior Education",
+        xlab = "Prior Educ Level",
+        ylab = "Total LMS Clicks",
+        col = "lightblue",
+        outline = TRUE,
+        las = 2, 
+        cex.axis = 0.8,
+        ylim = range(c(data$logSum_click, data$scal_score)))
+
+  
+points(jitter(as.numeric(data$high_educ)), 
+       data$scal_score, col = "red", pch = 16)
+```
+
+#### Observation: Shows the distribution of LMS clicks for each prior education group.
+
+- Median LMS activity appears similar across education groups, suggesting that prior education does not drastically affect baseline engagement levels.
+
+- However, dispersion and outlier density are substantial in all groups, indicating high individual variability in LMS use regardless of educational background.
+
+- Students with higher education show slightly higher median engagement and more extreme outliers—possibly reflecting greater familiarity or confidence with self-directed learning platforms.
+
+- Conversely, those with no formal qualifications or lower education levels demonstrate narrower interquartile ranges, implying less variation and generally lower engagement intensity.
+
+- Outliers indicate students who are unusually high or low in engagement relative to their group which may influence further analysis.
+
+- No resulting **Postgrad** values after log conversion but will retain for visibility
+
+
+#### INTERACTION EFFECT PLOT
+```{r varInteractn_1}
+
+# Split sum_click into 3 categories
+data$LMS_group <- cut(data$logSum_click, breaks = 3, 
+                      labels = c("Low", "Medium", "High"))
+```
+
+#### Fig 4. Effects of SES with LMS on Grades
+```{r varInteractn_2}
+
+# Ex: Interaction between SES, LMS usage (binned), and grades
+interaction.plot(x.factor = data$imd_band,
+                 trace.factor = data$LMS_group,
+                 response = data$scal_score,
+                 type = "b",
+                 col = c("red", "blue", "green"),
+                 pch = c(16, 17, 18),
+                 xlab = "Socio-Econ. Status(SES/idm_band)",
+                 ylab = "Mean Grade (Score)",
+                 trace.label = "LMS Usage Level",
+                 main = "Interaction: SES/IDM_band × LMS Usage on Grades")
+
+```
+
+#### Interaction Line Interpretation:  
+
+- High LMS Usage:  Students in this category consistently achieve positive mean grades, regardless of SES percentile. The relatively flat slope suggests that high LMS engagement compensates for socioeconomic disparities—students from lower SES bands perform nearly as well as their higher SES peers when engagement is strong.  This indicates an equalizing effect of active LMS participation.
+
+- Medium LMS Usage (blue line):  Displays a slight upward trend across SES bands, indicating moderate sensitivity to SES—students from higher socioeconomic backgrounds gain marginally higher grades for the same engagement level suggesting that contextual advantages (access, prior preparation) may still enhance learning outcomes under medium engagement conditions.
+
+- Low LMS Usage:  Exhibits the lowest and most volatile performance across all SES groups, with mean grades sharply below zero and no consistent improvement across SES bands.  This indicates that insufficient LMS participation undermines performance regardless of socioeconomic advantage.  SES alone does not offset low engagement.
+
+#### Fig.5: Regression Analysis LMS Engagement vs Grades by Age Group
+```{r varRegress}
+# Subset complete cases for relevant variables
+
+plot_data <- data[complete.cases(data[, c("logSum_click", "score", "age_band")]), ]
+
+# Create Scatterplot of LMS clicks vs grades, colored by age group
+age_groups <- unique(plot_data$age_band)
+colors <- rainbow(length(age_groups))
+
+plot(plot_data$logSum_click, plot_data$score,
+     col = as.factor(plot_data$age_band),
+     pch = 14,
+     xlab = "Log-Transformed LMS Clicks",
+     ylab = "Grade (Score)",
+     main = "LMS Engagement vs Grades by Age Group")
+
+# Add regression lines by age group
+for (i in seq_along(age_groups)) {
+  group_data <- subset(plot_data, age_band == age_groups[i])
+  if (nrow(group_data) > 2) {  # ensure enough data points
+    abline(lm(score ~ logSum_click, data = group_data), col = colors[i], lwd = 2)
+  }
+}
+
+legend("topleft", legend = age_groups, col = colors, pch = 8, title = "Age Group")
+```
+
+#### Regression Analysis
+- Positive Association:  Across most age bands, higher LMS clicks correspond with higher scores, suggesting that increased platform engagement is generally linked to improved academic performance.
+
+- Age Group Variation:  The slopes of the regression lines differ by age band, indicating that the *magnitude* of engagement’s benefit varies — engagement may be more predictive of performance for certain age groups.
+
+- Non-uniform Dispersion:  Vertical points are arranged differently across age categories, implying unequal variance possibly due to differing study behaviors or prior educational experience.
+
+- Linearity Holds Moderately:  While the fitted lines show overall linear trends, some curvature or clustering may exist, suggesting that nonlinear or interaction terms could improve model fit.
+
+- Potential Interaction Effect:  Age likely moderates the relationship between LMS engagement and performance; for confirmation, this warrants a multiple regression model with an interaction term (logSum_click * age_band) .
+
+#### View Current Structure of Data
+```{r finStrData}
+str(data)
+```
+
+```{r}
+df <- data   # Make copy of data
+
+# Convert necessary columns
+df$reg <- as.factor(df$reg) # Region as factor for ANOVA/Chi-square
+#df$fin_ResPass <- as.factor(df$fin_ResPass)  # Binary outcome as factor
+
+levels(df$reg)
+```
+#### Test Region's Contribution to the Score
+```{r tstRegion_Score}
+anova_model <- aov(scal_score ~ reg, data=df)
+summary(anova_model)
+```
+
+
+```{r}
+tukRes <- TukeyHSD(anova_model, "reg")
+```
+
+
+```{r}
+tukey_df <- as.data.frame(tukRes$reg)
+tukey_df$Comparison <- rownames(tukey_df)
+```
+
+#### Regions with Sign. p-Adj Values 
+```{r}
+sig_regions <- subset(tukey_df, `p adj` < 0.05)
+sig_regions <- sig_regions[, c("Comparison", "diff", "lwr", "upr", "p adj")]
+
+# sort by difference, descending
+sig_regions <- sig_regions[order(-sig_regions$diff), ]
+sig_regions
+```
+
+#### Extract only 1st level regions
+```{r}
+
+sig_regions$Region1_base <- sub("-.*", "", sig_regions$Comparison)
+sig_regions$Region2_base <- sub(".*-", "", sig_regions$Comparison) # HERE
+sig_regions$Region1_base
+```
+
+#### Summarize Regions based on Mean Diff and Adj p_Value
+```{r signRegions}
+library(dplyr)
+
+grouped_regions <- sig_regions %>%
+  group_by(Region1_base) %>%
+  summarise(diff_mean = mean(diff),
+            p_value_max = max(`p adj`)) %>%
+  arrange(-diff_mean) %>%
+  filter(p_value_max < 0.05)%>%
+  ungroup()
+```
+
+
+```{r}
+grouped_regions
+```
+
+```{r}
+
+# Get unique Region1_base values from significant Tukey results
+regions_to_keep <- unique(sig_regions$Region1_base)
+
+# Create a reduced Regions factor for Regression
+df$reduceReg <- ifelse(df$reg %in% regions_to_keep, as.character(df$reg), "Other")
+df$reduceReg <- factor(df$reduceReg)
+
+levels(df$reduceReg)   # Check the levels
+```
+
+#### Removing previously coded Variables to streamline further
+```{r removCodeReg}
+df <- df %>%
+  select(-starts_with("reg"))  # removes all columns like regEast_Midlands etc.
+
+df <- df %>% 
+  select(-c(disabilityY, fin_ResFail, fin_ResPass, final_result, genderM))
+```
+
+#### Further streamlining of final dataset by factor Conversions 
+```{r factConvVars}
+df$disabil <- as.factor(df$disability)  # Convert disability to factor
+df$code_mode <- as.factor(df$code_mode) #diff in score could be influenced by study mode 
+df$code_pres <- as.factor(df$code_pres)#diff in score could be influenced by course semester
+```
+
+#### Further streamlining - Removal of Unwanted Variable 
+```{r}
+df <- df %>% 
+  select(-c(disability))
+
+data <- df   #Recopy cleaned df to data for final dataset output
+```
+
+
+```{r}
+colnames(df)
+```
+
+
+```{r}
+head(df)
+```
+
+```{r}
+str(df)
+```
+
+## MODELING with RESULTS
+#### Declaration for Global Declarations
+```{r globDeclar}
+
+# function called by Full and Reduced Models - return metric values
+summary_metrics <- function(rmse, r2, aic, runtime, mae) {
+  data.frame(
+    Mean_RMSE   = mean(rmse, na.rm = TRUE),
+    SD_RMSE     = sd(rmse, na.rm = TRUE),
+    Mean_R2     = mean(r2, na.rm = TRUE),
+    Median_R2   = median(r2, na.rm = TRUE),
+    Mean_AIC    = mean(aic, na.rm = TRUE),
+    Avg_Runtime = mean(runtime, na.rm = TRUE),
+    Mean_MAE    = mean(mae, na.rm = TRUE),
+    SD_MAE      = sd(mae, na.rm = TRUE)
+  )
+}
+```
+
+
+#### Initialization of Metric Variables
+```{r globInitialization}
+
+#  SETUP====
+# Ensures each fold has a balanced spread of outcome values; preventing '0' variance 
+set.seed(123)
+k <- 5
+
+# Stratified fold assignment based on quantiles of the outcome variable
+df$fold <- cut(df$scal_score,
+               breaks = quantile(df$scal_score, probs = seq(0, 1, length.out = k + 1)),
+               include.lowest = TRUE, labels = FALSE)
+fold_ids <- sample(df$fold)
+
+# Initialize storage vectors
+rmse_full <- numeric(k)
+r2_full   <- numeric(k)
+aic_full  <- numeric(k)
+runTime_full     <- numeric(k)
+mae_full         <- numeric(k) 
+
+
+rmse_red <- numeric(k)
+r2_red   <- numeric(k)
+aic_red             <- numeric(k)
+runTime_red         <- numeric(k)
+mae_red             <- numeric(k)
+```
+
+
+#### Model 1 - Full Modeling
+```{r fullModel0}
+
+set.seed(123)
+k <- 5
+
+# Stratified fold assignment based on quantiles of the outcome variable
+df$fold <- cut(df$scal_score,
+               breaks = quantile(df$scal_score, probs = seq(0, 1, length.out = k + 1)),
+               include.lowest = TRUE, labels = FALSE)
+fold_ids <- sample(df$fold)
+
+rmse_full <- numeric(k)
+r2_full   <- numeric(k)
+aic_full  <- numeric(k)
+runTime_full     <- numeric(k)
+mae_full         <- numeric(k) 
+
+mlr_model_full <- lm(
+  scal_score ~ code_mode + reduceReg + gender + age_band + disabil +
+    high_educ + imd_band + finRes + logSum_click,data = df)
+
+#K-fold cross-validation for FULL MODEL
+for (f in 1:k) {
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  # Full model
+  start_time <- Sys.time()
+  model_full0 <- lm(formula(mlr_model_full), data = train_data)
+  end_time <- Sys.time()
+  runTime_full[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  preds_full <- predict(model_full0, newdata = val_data)
+  preds_full <- as.numeric(preds_full)  # convert to numeric if factor
+  preds_full <- preds_full[!is.na(preds_full)]  # remove any NAs
+  val_full <- val_data$scal_score[!is.na(preds_full)]
+
+  # RMSE
+  rmse_full[f] <- sqrt(mean((val_full - preds_full)^2, na.rm = TRUE))
+  mae_full[f] <- mean(abs(val_full - preds_full), na.rm = TRUE)
+  
+  # R² (handle zero variance)
+  ss_total <- sum((val_full - mean(val_full))^2)
+  ss_res   <- sum((val_full - preds_full)^2)
+  r2_full[f] <- ifelse(ss_total == 0, 0, 1 - ss_res / ss_total)
+
+  # AIC
+  aic_full[f] <- AIC(model_full0)
+}
+
+# Displays results on single page.
+res <- summary_metrics(rmse_full, r2_full, aic_full, runTime_full, mae_full)
+cat(paste(names(res), "=", round(unlist(res),4), collapse = "|"), "\n")
+```
+#### Prints Results from Full Model
+```{r fullModelPrnt}
+
+# Fit Full Model Formula
+finRes_Model <- lm(scal_score ~ code_mode + reduceReg + gender + age_band + disabil +
+    high_educ + imd_band + finRes + logSum_click,data = df)
+summary(finRes_Model)
+```
+From here, can get significant variables: Code_mode(0.001), gender, disabil, high_educ(variable range), imd_band (0.001), finRes(0.001) and Sum_click(0.001).  
+
+#### Model 2 - Reduced Model Built Out
+```{r redModel}
+
+# Forwarding only significant variable from MOdel 1
+df$code_mode <- factor(df$code_mode)
+df$gender    <- factor(df$gender)
+df$disabil   <- factor(df$disabil)
+df$high_educ <- factor(df$high_educ)
+df$imd_band  <- factor(df$imd_band)
+df$finRes    <- factor(df$finRes)
+
+rmse_red2 <- numeric(k)
+r2_red2   <- numeric(k)
+aic_red2             <- numeric(k)
+runTime_red2         <- numeric(k)
+mae_red2             <- numeric(k)
+
+
+#  reduced Model formula
+reduced_formula <- scal_score ~ code_mode + gender + disabil +  high_educ + imd_band + finRes + logSum_click
+
+# k-fold CV loop
+for(f in 1:k){
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  # ----- Reduced model -----
+  start_time <- Sys.time()
+  model_red2 <- lm(reduced_formula, data = train_data)
+  end_time <- Sys.time()
+  runTime_red2[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  preds_red2 <- predict(model_red2, newdata = val_data)
+  preds_red2 <- as.numeric(preds_red2)
+  val_red2   <- val_data$scal_score[!is.na(preds_red2)]
+  preds_red2 <- preds_red2[!is.na(preds_red2)]
+  
+  # RMSE
+  rmse_red2[f] <- sqrt(mean((val_red2 - preds_red2)^2))
+  mae_red2[f] <- mean(abs(val_red2 - preds_red2), na.rm = TRUE)
+  
+  # R² calculation
+  ss_total <- sum((val_red2 - mean(val_red2))^2)
+  ss_res   <- sum((val_red2 - preds_red2)^2)
+  r2_red2[f] <- ifelse(ss_total == 0, 0, 1 - ss_res / ss_total)
+  aic_red2[f] <- AIC(model_red2)
+}
+# Displays results on single page.
+res2 <- summary_metrics(rmse_red2, r2_red2, aic_red2, runTime_red2, mae_red2)
+cat(paste(names(res2), "=", round(unlist(res2),4), collapse = "|"), "\n")
+```
+
+#### REDUCED MODEL Print
+```{r redModelPrnt, echo=FALSE}
+summary(model_red2)
+```
+
+- R² (0.4805) tells how much variance in scal_score is explained by the predictors, highlighting explanatory power. Higher R² (closer to 1) indicates better explanatory power.  Fold-wise averaging accounts for potential variability across CV splits.
+
+- Adj. R-2 is similar to R-squared, but it penalizes the addition of weaker predictors.
+
+- AIC allows model comparison, balancing fit and complexity — useful if considering alternative models or regularized approaches.  Lower AIC indicates a better trade-off between fit and simplicity. Useful for comparing alternative models in future work.
+
+#### Fig.6: Model Plot Assumption Tests
+```{r modPlots, fig.height = 6.5, echo=FALSE}
+
+par(mfrow = c(2, 2))  # 4-panel layout
+plot(model_red2)     
+box(lwd = 2)  
+```
+- Residuals vs Fitted:  Checks linearity and homoscedasticity.  A random scatter around zero indicates the linear model assumption is reasonable.
+
+- Normal Q-Q:  Evaluates normality of residuals where points closely following the diagonal suggest normally distributed residuals.
+
+- Scale-Location:  Tests for constant variance (homoscedasticity). A horizontal line with evenly spread points confirms variance stability across fitted values.
+
+- Residuals vs Leverage:  Identifies influential observations.  Points with high leverage and large residuals may disproportionately affect the model; these can be investigated further.
+
+#### Fig.7: RMSE Fold-Wise Accuracy Curve
+```{r foldRMSE, fig.height = 3.5}
+barplot(rmse_red, names.arg = 1:k, col = "lightgreen",
+        main = "Fold-wise RMSE",
+        xlab = "Fold",
+        ylab = "RMSE")
+abline(h = mean(rmse_red), col = "red", lwd = 2, lty = 2)
+legend("topright", legend = "Mean RMSE", col = "red", lty = 2, lwd = 4)
+
+box(which = "outer", lwd = 2)  # Add rectangular border around plot
+```
+
+Step performed to improve predictive power of model exploring **Cross-fold Validation**.
+
+**Interpretation**:  Bars show RMSE for each fold.  The red dashed line shows mean RMSE across folds.  This highlights variability and identifies folds with higher prediction error, reinforcing understanding of the model stability.
+
+```{r include=FALSE}
+colnames(df)
+```
+
+
+#### Fig.8: Boxplots - Categorical Predictors on Scal_Score
+```{r boxPlots, fig.height = 6.5, echo=FALSE}
+
+par(mfrow = c(3, 2))  # 3 rows, 2 columns
+
+boxplot(scal_score ~ code_mode, data = df, main = "By Code Mode", col = "lightblue")
+boxplot(scal_score ~ gender, data = df, main = "By Gender", col = "lightgreen")
+boxplot(scal_score ~ disabil, data = df[df$disabil=="Y", ], main ="By Disability", col = "lightblue")
+boxplot(scal_score ~ high_educ, data = df, main = "By High Education", col = "lightgreen")
+boxplot(scal_score ~ imd_band, data = df, main = "By IMD Band", col = "lightblue")
+boxplot(scal_score ~ finRes, data=df[df$finRes == "Pass", ], main = "By Final Results", col="lightgreen")
+
+par(mfrow = c(1, 1))  # reset layout
+```
+Box plot analysis perform to visualized the general shape of the predictors to result in decision to further transform the Independent Variable.
+
+Interpretation: Code_mode describes the given module type per semester in which LMS is accessed.
+
+- Differences in median and spread across code_mode categories illustrate which levels contribute more or less to predicted scal_score.
+
+1. Code Mode: The distribution of scal_score varies noticeably across code modes, suggesting that the mode of instruction has a meaningful influence on learner performance.
+
+2. Gender:  The scal_score distributions for different genders appear similar, indicating that gender does not have a strong effect on overall scoring patterns.
+
+3. Disability (Y):  Among learners with a recorded disability, the spread of scal_score is wider and the median may be lower, reflecting greater variability in performance within this subgroup.
+
+4. High Education:  Learners with higher education levels tend to show higher median scal_scores and often less variability, implying a performance advantage associated with prior educational attainment.
+
+5. IMD Band:  The scal_score varies across IMD bands, suggesting that socioeconomic context may play a role, with some bands showing higher central scores or reduced spread compared to others.
+
+6. Final Results (Pass):  Among those who passed, the scal_score distribution is more concentrated with a higher median, consistent with stronger performance and fewer very low scores in this subset.
+
+- To strengthen the predictive effect of categorical predictors, we can reduce  noise, logical group levels, ordinal coding, test interaction effects, winsorize outliers, and relate variables to behavioral engagement metrics. These changes would better isolate meaningful performance differences between independent variables and increase their overall predictive value within the model.
+
+#### Model 3 Improvement: Handling Muiltiple Catergorical Outliers (Grouping)
+```{r scalScore_Winsor}
+
+# For variables from Model 2 which prove significant, these will be used here with a transformed score.
+
+k <- 5  # folds
+rmse_red3 <- numeric(k)
+mae_red3  <- numeric(k)
+r2_red3   <- numeric(k)
+aic_red3  <- numeric(k)
+runTime_red3 <- numeric(k)
+
+# winsorizes (trims) scal_score between the 5th and 95th percentiles, separately for each combination of variables in group_by list;
+#mutate: creates TRANSFORMED DEPENDENT variable from trimmed range
+df <- df %>%
+  group_by(code_mode, gender=="genderM", disabil=="Y", high_educ,imd_band, finRes=="Pass") %>%
+  mutate(Wscal_score = pmin(pmax(scal_score, quantile(scal_score, 0.05)),
+                             quantile(scal_score, 0.95))) %>%
+  ungroup()  #Removes grouping to return to a normal dataframe
+
+#set.seed(123)
+fold_ids <- sample(1:k, nrow(df), replace=TRUE)
+
+# ----- 5-Fold CV Loop -----
+for(f in 1:k){
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  # Time the model fitting
+  start_time <- Sys.time()
+  model_red3 <- lm(Wscal_score ~ code_mode + high_educ + imd_band + logSum_click, data = train_data[train_data$gender=="M" & train_data$disabil=="Y" & train_data$finRes=="Pass", ])
+  end_time <- Sys.time()
+  runTime_red3[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Predictions - Have to use same format as training model
+  preds_red3 <- predict(model_red3, newdata = val_data[val_data$gender=="M" & val_data$disabil=="Y" & val_data$finRes=="Pass", ])
+  
+  #val_Wred   <- val_data$Wscal_score[!is.na(preds_red)]
+  
+  val_sub <- val_data[val_data$gender=="M" &
+                    val_data$disabil=="Y" &
+                    val_data$finRes=="Pass", ]
+
+if(nrow(val_sub) < 2){
+    next
+}
+
+preds_red3 <- predict(model_red3, newdata = val_sub)
+val_red3   <- val_sub$scal_score
+
+common <- complete.cases(val_red3, preds_red3)
+val_red3 <- val_red3[common]
+preds_red3 <- preds_red3[common]
+
+rmse_red3[f] <- sqrt(mean((val_red3 - preds_red3)^2))
+mae_red3[f]  <- mean(abs(val_red3 - preds_red3))
+  
+ss_total <- sum((val_red3 - mean(val_red3))^2)
+ss_res   <- sum((val_red3 - preds_red3)^2)
+r2_red3[f] <- ifelse(ss_total==0, 0, 1 - ss_res/ss_total)
+aic_red3[f] <- AIC(model_red3)
+}
+red3 <- summary_metrics(rmse_red3, r2_red3, aic_red3, runTime_red3, mae_red3)
+cat(paste(names(red3), "=", round(unlist(red3),4), collapse = "|"), "\n")
+#cv_results
+```
+
+In summary, these results are from winsorizing (reduced variability) and from fitting the model only on a tiny filtered subset (low signal, unstable folds). Have to revert.
+
+#### Model 3 Improvement Summary
+```{r WredModelPrnt, echo=FALSE}
+
+summary(model_red3)
+```
+**NOTE**: Only sum_click is showing as significant predictor - Model needs to be revamped.
+#### Model Comparisons
+**Reduced subset model (filtered by gender = M, disabil = Y, finRes = Pass)**
+
+- Residual standard error: 0.444 → model errors are relatively small within this subset.
+- R² = 0.126, Adjusted R² = 0.088 → explains only about 9–13% of the variance in `Wscal_score`; much lower predictive power.
+- F-statistic significant (p = 1.23e-05) → the model as a whole is statistically significant despite low explanatory power.
+- Smaller sample (n ≈ 474) due to subsetting → less data reduces model stability and generalizability.
+
+**Full reduced model (all observations)**
+- Residual standard error: 0.732 → slightly higher absolute errors due to full variability in the dataset.
+
+- R² = 0.481, Adjusted R² = 0.480 → explains about 48% of variance; considerably better predictive power.
+
+- F-statistic highly significant (p < 2.2e-16) → strong overall model fit.
+
+- Larger sample (n ≈ 21,000) → model more stable and generalizable.
+
+**Key takeaway:** Subsetting by specific groups reduces variance explained, lowering predictive power, even though the model remains statistically significant. The full dataset model provides stronger overall fit and more reliable predictions.
+
+The full dataset model provides a stronger overall fit and more reliable predictions because its larger sample size, greater variability, and more representative coverage of predictor effects produce more stable, generalizable coefficients, better capture subtle interactions, and explain substantially more variance than the small subset model.
+
+#### Comparison of Summaries: scal_score vs Winscal_score
+```{r SummaryScal_score, include=FALSE, echo=FALSE}
+
+summStats <- data.frame(
+  OrigSumm = summary(df$scal_score),
+  WinSumm = summary(df$Wscal_score)
+)
+summStats
+```
+
+
+#### Model 4: Re-Imploring Winsorized Reduced Model - with Interaction
+```{r fullModelInter}
+
+# Testing for possibility of reducing model based on returned sig. values
+
+model_red4 <-lm(Wscal_score ~ code_mode + gender * disabil * finRes + high_educ + imd_band + logSum_click, data = df)
+
+# Extract residuals summary
+resid_summary <- summary(model_red4)$residuals
+summary(model_red4)
+```
+**NOTE**: gender and disabil are being removed: lm(formula = Wscal_score ~ code_mode * finRes + high_educ + imd_band + logSum_click, data = df)
+
+#### Model 4: Winsorized Reduced Model + 5-Fold Cross-Validation + Interaction
+```{r}
+# Ensure required packages
+library(dplyr)
+
+k <- 5  # folds
+rmse_red4 <- numeric(k)
+mae_red4  <- numeric(k)
+r2_red4   <- numeric(k)
+aic_red4  <- numeric(k)
+runTime_red4 <- numeric(k)
+
+
+# Assuming Wscal_score exists in df as winsorized version of scal_score
+
+# Loop through folds
+for(f in 1:k) {
+  
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  # Fit winsorized reduced model with interaction
+  start_time <- Sys.time()
+  model_red4 <- lm(Wscal_score ~ code_mode+gender*disabil*high_educ+imd_band+finRes+logSum_click, data=train_data)
+  end_time <- Sys.time()
+  runTime_red4[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Predict on validation fold
+  preds4 <- predict(model_red4, newdata = val_data)
+  preds4 <- as.numeric(preds4)
+  
+  # Remove any NA predictions (if present)
+  val_actual <- val_data$Wscal_score[!is.na(preds4)]
+  preds4 <- preds4[!is.na(preds4)]
+  
+  # Compute RMSE
+  rmse_red4[f] <- sqrt(mean((val_actual - preds4)^2, na.rm = TRUE))
+  
+  # Compute MAE
+  mae_red4[f] <- mean(abs(val_actual - preds4), na.rm = TRUE)
+  
+  # Compute R-squared (handle zero variance)
+  ss_total <- sum((val_actual - mean(val_actual))^2)
+  ss_res   <- sum((val_actual - preds4)^2)
+  r2_red4[f] <- ifelse(ss_total == 0, 0, 1 - ss_res / ss_total)
+  
+  # AIC
+  aic_red4[f] <- AIC(model_red4)
+}
+
+# Display CV metrics for winsorized reduced model
+model_red4 <- summary_metrics(rmse_red4, r2_red4, aic_red4, runTime_red4, mae_red4)
+#print(cv_results)
+cat(paste(names(model_red4), "=", round(unlist(model_red4),4), collapse = "|"), "\n")
+
+```
+
+#### Model 4: Summary
+```{r echo=FALSE}
+# Fit full winsorized reduced model on entire dataset
+#model_red4 <- lm(Wscal_score ~ code_mode + gender*disabil * finRes + high_educ + imd_band + logSum_click, data = df)
+summary(model_red4)
+```
+Based on current model summary, will remove **disabil and gender** from new model, 5.
+
+
+#### Model 5: Wins Reduced Model + 5-Fold Cross-Validation + Further Reduced Interaction
+```{r}
+# Ensure required packages
+library(dplyr)
+
+runTime_fold5 <- numeric(k)
+rmse_fold5 <- numeric(k)
+mae_fold5 <- numeric(k)
+r2_fold5 <- numeric(k)
+aic_fold5 <- numeric(k)
+
+# Assuming Wscal_score exists in df as winsorized version of scal_score
+# Loop through folds
+for(f in 1:k) {
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  # Fit winsorized reduced model with interaction
+  start_time <- Sys.time()
+  model_fold5 <- lm(Wscal_score ~ code_mode * high_educ + imd_band + finRes + logSum_click, data=train_data)
+  
+  end_time <- Sys.time()
+  runTime_fold5[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Predict on validation fold
+  preds5 <- predict(model_fold5, newdata = val_data)
+  preds5 <- as.numeric(preds5)
+  
+  # Remove any NA predictions (if present)
+  val_actual <- val_data$Wscal_score[!is.na(preds5)]
+  preds5 <- preds5[!is.na(preds5)]
+  
+  # Compute RMSE
+  rmse_fold5[f] <- sqrt(mean((val_actual - preds5)^2, na.rm = TRUE))
+  
+  # Compute MAE
+  mae_fold5[f] <- mean(abs(val_actual - preds5), na.rm = TRUE)
+  
+  # Compute R-squared (handle zero variance)
+  ss_total <- sum((val_actual - mean(val_actual))^2)
+  ss_res   <- sum((val_actual - preds5)^2)
+  r2_fold5[f] <- ifelse(ss_total == 0, 0, 1 - ss_res / ss_total)
+  
+  # AIC
+  aic_fold5[f] <- AIC(model_fold5)
+}
+
+# Display CV metrics for winsorized reduced model
+model_red5<- summary_metrics(rmse_fold5, r2_fold5, aic_fold5, runTime_fold5, mae_fold5)
+#print(cv_results)
+cat(paste(names(model_red5), "=", round(unlist(model_red5),4), collapse = "|"), "\n")
+```
+#### **Model 5 Anal**: No predictive improvement seen with Model 5.  Will run summary and anticipate model change(s).
+
+#### Model 5: SUMMARY
+```{r}
+# Fit full winsorized reduced model on entire dataset
+#model_fold <- lm(Wscal_score ~ code_mode * finRes + high_educ + imd_band + #logSum_click, data = df)
+summary(model_fold5)
+```
+#### Model 6: GBM with Wins + 5-Fold CV + Full Pred Interaction - GRID SEARCH 
+```{r gbWinModeling2}
+
+# Prepare 5-fold cross-validation
+k <- 5
+fold_ids <- sample(1:k, nrow(df), replace = TRUE)
+
+# Define parameter grid for tuning
+tune_grid <- expand.grid(
+  n.trees = c(300, 500, 800),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.05, 0.1),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+# Initialize vectors to store CV metrics
+rmse_gb6 <- numeric(k)
+mae_gb6 <- numeric(k)
+r2_gb6   <- numeric(k)
+aic_gb6  <- numeric(k)  # AIC is approximate for GB
+runtime_gb6 <- numeric(k)
+
+# 5-fold CV loop
+for (f in 1:k) {
+  
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  best_rmse6 <- Inf
+  best_model6 <- NULL
+  
+  start_time <- Sys.time()
+  
+  # Grid search over tuning parameters
+  for(i in 1:nrow(tune_grid)) {
+    gbm_model6 <- gbm(
+      formula = Wscal_score ~ code_mode + gender*disabil*finRes + high_educ + imd_band + finRes+logSum_click,
+      data = train_data,
+      distribution = "gaussian",
+      n.trees = tune_grid$n.trees[i],
+      interaction.depth = tune_grid$interaction.depth[i],
+      shrinkage = tune_grid$shrinkage[i],
+      n.minobsinnode = tune_grid$n.minobsinnode[i],
+      verbose = FALSE
+    )
+  
+   preds6 <- predict(gbm_model6, newdata = val_data, n.trees =  tune_grid$n.trees[i])
+   rmse_fold6 <- sqrt(mean((val_data$Wscal_score - preds6)^2, na.rm = TRUE))
+    
+    # Track best model
+    if(rmse_fold6 < best_rmse6) {
+      best_rmse6 <- rmse_fold6
+      best_model6 <- gbm_model6
+    }   #rmse_fold6 < best_rmse6
+  }   # for i in 1:nrow
+  
+  end_time <- Sys.time()
+  runtime_gb6[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  if (is.null(best_model6)) {
+     stop("No model was selected during tuning — check grid or formula.")
+  }   #is.null(best_model6)
+
+  # Make predictions with best model
+  preds_best6 <- predict(best_model6, newdata = val_data, n.trees = best_model6$n.trees)
+  
+  # Compute metrics
+  rmse_gb6[f] <- sqrt(mean((val_data$Wscal_score - preds_best6)^2, na.rm = TRUE))
+  mae_gb6[f]  <- mean(abs(val_data$Wscal_score - preds_best6), na.rm = TRUE)
+  
+  # Compute R2
+  ss_total <- sum((val_data$Wscal_score - mean(val_data$Wscal_score, na.rm = TRUE))^2)
+  ss_res   <- sum((val_data$Wscal_score - preds_best6)^2)
+  r2_gb6[f] <- ifelse(ss_total==0, 0, 1 - ss_res/ss_total)
+  
+  aic_gb6[f] <- NA  # AIC not directly available for GBM regression
+  
+}
+
+# Summarize CV metrics
+model_red6 <- data.frame(
+  Mean_RMSE = round(mean(rmse_gb6),4),
+  SD_RMSE   = round(sd(rmse_gb6),4),
+  Mean_MAE  = round(mean(mae_gb6),4),
+  SD_MAE    = round(sd(mae_gb6),4),
+  Mean_R2   = round(mean(r2_gb6),4),
+  SD_R2     = round(sd(r2_gb6),4),
+  Avg_Runtime = round(mean(runtime_gb6),4)
+)
+
+print(model_red6)
+#print(cv_summary)
+best_model6$var.names <- abbreviate(best_model6$var.names, minlength = 6)
+par(mar = c(5, 12, 4, 2))
+summary(best_model6)
+``` 
+
+**NOTES**:  
+This is the best model thus far.  Relative influence of interactions reports near 0 for gender and disabil; these to be dropped from the model.  Code_mode (8.5%), imd_band (2.6%), and high_educ (1.17%) are weak predictors, but may still prove meaningful - to remain.
+
+#### Model 7: GBM with Wins + 5-Fold CV + Reduced Preds - GRID SEARCH
+```{r}
+
+library(gbm)
+library(dplyr)
+
+# 5-Fold Cross-Validation
+k <- 5
+
+# Initialize vectors to store CV metrics
+runTime_red7 <- numeric(k)
+rmse_red7 <- numeric(k)
+mae_red7 <- numeric(k)
+r2_red7 <- numeric(k)
+aic_red7 <- numeric(k)
+
+set.seed(123)  # For reproducibility
+fold_ids <- sample(1:k, nrow(df), replace = TRUE)
+
+# Parameter grid for tuning
+tune_grid <- expand.grid(
+  n.trees = c(300, 500, 800),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.05, 0.1),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+
+# ----- 5-Fold CV Loop -----
+for (f in 1:k) {
+  
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  best_rmse7 <- Inf
+  best_model7 <- NULL
+  best_n_trees <- NA
+  
+  start_time <- Sys.time()
+  
+  # Grid search over tuning parameters
+  for (i in 1:nrow(tune_grid)) {
+    
+    gbm_model7 <- gbm(
+      formula = Wscal_score ~ code_mode * finRes + high_educ + imd_band + logSum_click,
+      data = train_data,
+      distribution = "gaussian",
+      n.trees = tune_grid$n.trees[i],
+      interaction.depth = tune_grid$interaction.depth[i],
+      shrinkage = tune_grid$shrinkage[i],
+      n.minobsinnode = tune_grid$n.minobsinnode[i],
+      verbose = FALSE
+    )
+    
+    # Filter validation rows with complete cases
+    val_fold <- val_data %>%
+      filter(complete.cases(select(., code_mode, finRes, high_educ, imd_band, logSum_click, Wscal_score)))
+    
+    if (nrow(val_fold) == 0) next  # Skip fold if no complete rows
+    
+    # Predictions for this grid iteration
+    preds7 <- predict(gbm_model7, newdata = val_fold, n.trees = tune_grid$n.trees[i])
+    
+    # Compute RMSE
+    rmse_red7 <- sqrt(mean((val_fold$Wscal_score - preds7)^2))
+    
+    # Track best model for this fold
+    if (rmse_red7 < best_rmse7) {
+       best_rmse7 <- rmse_red7
+       best_model7 <- gbm_model7
+       best_n_trees <- tune_grid$n.trees[i]
+    }
+  }
+  
+  end_time <- Sys.time()
+  runTime_red7[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Predict on validation fold using the best model
+  if (!is.null(best_model7) & !is.na(best_n_trees) & nrow(val_fold) > 0) {
+    preds_best7 <- predict(best_model7, newdata = val_fold, n.trees = best_n_trees)
+    
+    # Compute metrics
+    rmse_red7[f] <- sqrt(mean((val_fold$Wscal_score - preds_best7)^2))
+    mae_red7[f]  <- mean(abs(val_fold$Wscal_score - preds_best7))
+    
+    ss_total <- sum((val_fold$Wscal_score - mean(val_fold$Wscal_score))^2)
+    ss_res   <- sum((val_fold$Wscal_score - preds_best7)^2)
+    r2_red7[f] <- ifelse(ss_total == 0, 0, 1 - ss_res/ss_total)
+  } else {
+    rmse_red7[f] <- NA
+    mae_red7[f]  <- NA
+    r2_red7[f]   <- NA
+  }
+}
+
+# Summarize CV metrics
+model_red7 <- data.frame(
+  Mean_RMSE  = round(mean(rmse_red7, na.rm = TRUE), 4),
+  SD_RMSE    = round(sd(rmse_red7, na.rm = TRUE), 4),
+  Mean_MAE   = round(mean(mae_red7, na.rm = TRUE), 4),
+  SD_MAE     = round(sd(mae_red7, na.rm = TRUE), 4),
+  Mean_R2    = round(mean(r2_red7, na.rm = TRUE), 4),
+  SD_R2      = round(sd(r2_red7, na.rm = TRUE), 4),
+  Avg_Runtime = round(mean(runTime_red7, na.rm = TRUE), 4)
+)
+
+print(model_red7)
+
+# Refit GBM on full dataset using the best parameters from the last fold (optional)
+final_gbm7 <- gbm(
+  formula = Wscal_score ~ code_mode * finRes + high_educ + imd_band + logSum_click,
+  data = df,
+  distribution = "gaussian",
+  n.trees = best_n_trees,
+  interaction.depth = best_model7$interaction.depth,
+  shrinkage = best_model7$shrinkage,
+  n.minobsinnode = best_model7$n.minobsinnode,
+  verbose = FALSE
+)
+
+# Variable importance plot
+par(mar = c(5, 12, 4, 2))
+summary(final_gbm7, plotit = TRUE)
+```
+
+**NOTES**: MSE (0.6551 ± 0.0128) and MAE (0.4679 ± 0.0093) indicate moderate prediction errors, with low variation across folds.
+
+R² (0.5659 ± 0.0126) shows the model explains about 56% of the variance, which is decent for this dataset.
+
+Avg_Runtime (133.79 sec) reflects that the 5-fold CV with grid search is computationally intensive.
+
+Overall, the model is reasonably accurate and stable, but tuning or feature engineering could improve predictive power.
+
+Key drivers of prediction are **logSum_click, finRes, code_mode, and imd_band**, while disabil and gender are not longer significant contributors. The model is an ensemble of sequential trees, where each tree learns to correct the errors of the previous ones using controlled complexity (interaction.depth), learning rate (shrinkage), number of boosting iterations (ntrees), and minimum node size (n.minobsinnode) to balance accuracy and overfitting.  Though code_mode and imd_band have low relative inferencem, they *may* still be of value.
+
+#### Model 8: Fine Tuned GBM with Parameters: Winsorized FURTHER Reduced Model with Interaction
+```{r gbWinModeling}
+
+# Prepare 5-fold cross-validation
+k <- 5
+fold_ids <- sample(1:k, nrow(df), replace = TRUE)
+
+# Define parameter grid for tuning
+tune_grid <- expand.grid(
+  n.trees = c(300, 500, 800),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.05, 0.1),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+# Initialize vectors to store CV metrics
+rmse_gb8 <- numeric(k)
+mae_gb8 <- numeric(k)
+r2_gb8   <- numeric(k)
+aic_gb8  <- numeric(k)  # AIC is approximate for GB
+runtime_gb8 <- numeric(k)
+
+# 5-fold CV loop
+for (f in 1:k) {
+  
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  best_rmse8 <- Inf
+  best_model8 <- NULL
+  
+  start_time <- Sys.time()
+  
+  # Grid search over tuning parameters
+  for(i in 1:nrow(tune_grid)) {
+    gbm_model8 <- gbm(
+      formula = Wscal_score ~ finRes*logSum_click, data=train_data,
+      distribution = "gaussian",
+      n.trees = tune_grid$n.trees[i],
+      interaction.depth = tune_grid$interaction.depth[i],
+      shrinkage = tune_grid$shrinkage[i],
+      n.minobsinnode = tune_grid$n.minobsinnode[i],
+      verbose = FALSE
+    )
+    
+    preds8 <- predict(gbm_model8, newdata = val_data, n.trees = tune_grid$n.trees[i])
+    rmse_gb8 <- sqrt(mean((val_data$Wscal_score - preds8)^2, na.rm = TRUE))
+    
+    # Track best model
+    if(rmse_gb8 < best_rmse8) {
+      best_rmse8 <- rmse_gb8
+      best_model8 <- gbm_model8
+    }
+  }
+  
+  end_time <- Sys.time()
+  runtime_gb8[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Make predictions with best model
+  preds_best8 <- predict(best_model8, newdata = val_data, n.trees = best_model8$n.trees)
+  
+  # Compute metrics
+  rmse_gb8[f] <- sqrt(mean((val_data$Wscal_score - preds_best8)^2, na.rm = TRUE))
+  mae_gb8[f]  <- mean(abs(val_data$Wscal_score - preds_best8), na.rm = TRUE)
+  # Compute R2
+  ss_total <- sum((val_data$Wscal_score - mean(val_data$Wscal_score, na.rm = TRUE))^2)
+  ss_res   <- sum((val_data$Wscal_score - preds_best8)^2)
+  r2_gb8[f] <- ifelse(ss_total==0, 0, 1 - ss_res/ss_total)
+  
+  aic_gb8[f] <- NA  # AIC not directly available for GBM regression
+}
+
+# Summarize CV metrics
+model_gb8 <- data.frame(
+  Mean_RMSE = round(mean(rmse_gb8),4),
+  SD_RMSE   = round(sd(rmse_gb8),4),
+  Mean_MAE  = round(mean(mae_gb8),4),
+  SD_MAE    = round(sd(mae_gb8),4),
+  Mean_R2   = round(mean(r2_gb8),4),
+  SD_R2     = round(sd(r2_gb8),4),
+  Avg_Runtime = round(mean(runtime_gb8),4)
+)
+
+print(model_gb8)
+gbm_model8$var.names <- abbreviate(gbm_model8$var.names, minlength = 6)
+par(mar = c(5, 12, 4, 2))
+summary(gbm_model8)  # Get view of variable importance
+```
+
+**Notes- Model 8**: Seems as thought the interaction of variables are not having significant indicators of scores.  Can conclude that the number of clicks and the academic status greatly affects scores.
+
+- R-squared greatly increased to 56%.  Given that the data is from a social sphere, this is deemed to be significant.
+
+
+#### Model 9: Increased Grid Params, Winsorized, Same Model (Interaction 2 Parms)
+```{r gbWinModeling}
+
+# Prepare 5-fold cross-validation
+k <- 5
+fold_ids <- sample(1:k, nrow(df), replace = TRUE)
+
+# Define parameter grid for tuning; more trees, deeper trees, smaller shrinkage
+tune_grid <- expand.grid(
+  n.trees = c(500, 700, 1000),
+  interaction.depth = c(8, 10, 12),
+  shrinkage = c(0.001, 0.01, 0.02),
+  n.minobsinnode = c(10, 15)
+)
+
+# Initialize vectors to store CV metrics
+rmse_gb9 <- numeric(k)
+mae_gb9  <- numeric(k)
+r2_gb9   <- numeric(k)
+aic_gb9  <- numeric(k)  # AIC is approximate for GB
+runtime_gb9 <- numeric(k)
+
+# 5-fold CV loop
+for (f in 1:k) {
+  
+  train_data <- df[fold_ids != f, ]
+  val_data   <- df[fold_ids == f, ]
+  
+  best_rmse9 <- Inf
+  best_model9 <- NULL
+  
+  start_time <- Sys.time()
+  
+  # Grid search over tuning parameters
+  for(i in 1:nrow(tune_grid)) {
+    gbm_model9 <- gbm(
+      formula = Wscal_score ~ finRes*logSum_click, data=train_data,
+      distribution = "gaussian",
+      n.trees = tune_grid$n.trees[i],
+      interaction.depth = tune_grid$interaction.depth[i],
+      shrinkage = tune_grid$shrinkage[i],
+      n.minobsinnode = tune_grid$n.minobsinnode[i],
+      verbose = FALSE
+    )
+    
+    preds9 <- predict(gbm_model9, newdata = val_data, n.trees = tune_grid$n.trees[i])
+    rmse_fold9 <- sqrt(mean((val_data$Wscal_score - preds9)^2, na.rm = TRUE))
+    
+    # Track best model
+    if(rmse_fold9 < best_rmse9) {
+      best_rmse9 <- rmse_fold9
+      best_model9 <- gbm_model9
+    }
+  }
+
+  end_time <- Sys.time()
+  runtime_gb9[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Make predictions with best model
+  preds9 <- predict(best_model9, newdata = val_data, n.trees = best_model9$n.trees)
+  
+  # Compute metrics
+  rmse_gb9[f] <- sqrt(mean((val_data$Wscal_score - preds9)^2, na.rm = TRUE))
+  mae_gb9[f]  <- mean(abs(val_data$Wscal_score - preds9), na.rm = TRUE)
+  
+  # Compute R2
+  ss_total <- sum((val_data$Wscal_score - mean(val_data$Wscal_score, na.rm = TRUE))^2)
+  ss_res   <- sum((val_data$Wscal_score - preds9)^2)
+  r2_gb9[f] <- ifelse(ss_total==0, 0, 1 - ss_res/ss_total)
+  
+  aic_gb9[f] <- NA  # AIC not directly available for GBM regression
+}
+
+# Summarize CV metrics
+model_red9 <- data.frame(
+  Mean_RMSE = round(mean(rmse_gb9),4),
+  SD_RMSE   = round(sd(rmse_gb9),4),
+  Mean_MAE  = round(mean(mae_gb9),4),
+  SD_MAE    = round(sd(mae_gb9),4),
+  Mean_R2   = round(mean(r2_gb9),4),
+  SD_R2     = round(sd(r2_gb9),4),
+  Avg_Runtime = round(mean(runtime_gb9),4)
+)
+
+print(model_red9)
+gbm_model9$var.names <- abbreviate(gbm_model9$var.names, minlength = 6)
+par(mar = c(5, 12, 4, 2))
+summary(gbm_model9)  # Get view of variable importance
+```
+
+#### Fig.9: Click vs Score (Numerical Analysis)
+```{r}
+df$logClick_bin <- cut(df$logSum_click,
+                       breaks = quantile(df$logSum_click, probs = seq(0,1,0.25), na.rm=TRUE),
+                       include.lowest = TRUE) 
+
+boxplot(Wscal_score ~ logClick_bin, data = df,
+        main = "Scaled Score by Log Click Activity (Quartiles)",
+        xlab = "Log Click Activity (binned)",
+        ylab = "Scaled Score",
+        col = "lightblue")
+```
+
+
+Unlike categorical factors, logSum_click shows a continuous and consistent positive relationship with achievement, and its explanatory power can be further improved by modeling nonlinearity, reducing extreme values, and integrating engagement interactions with learner characteristics.
+
+The logSum_click variable represents total engagement to reduce skew. Because it is continuous and expressed in log-units, we discretize it into quartile bins to visualize score patterns across increasing levels of activity.
+
+The boxplot shows that scaled assessment scores increase monotonically with higher logSum_click quartiles, indicating that students who engage more deeply with the digital platform consistently achieve higher performance scores. While there is overlap in score distributions across bins, the upward trend is clear, with the top quartile exhibiting both a higher median score and a higher upper range.
+
+This suggests that logSum_click is a strong and stable predictor of performance, consistent with the regression results where its coefficient was highly significant and of great magnitude.
+
+#### Fig.11: Relationship between Transformed Num Predictor and Dependent Variable
+```{r}
+plot(df$logSum_click, df$Wscal_score)
+lines(lowess(df$logSum_click, df$Wscal_score), col="red")
+```
+
+**Observations**:
+1. Strong upward trend:  The red smoothing line shows that as logSum_click increases, predicted performance increases as well — students who interact more with the platform tend to earn higher scores.
+
+2. Diminishing returns: Curve is steep at lower click levels, then gradually flattens: Early increases in engagement yield large performance gains.  At higher engagement levels, additional activity still helps, but each extra unit matters less
+
+
+3. Dense cluster at moderate-to-high engagement: Most clickss are between 4 and 9; most scores between -0.5 and +1.  This suggests typical users engage moderately and achieve modestly positive scores.
+
+
+4. Low performers at zero activity: Number of students with 0 clicks have very low scores (Wscal_score ≤ -2), reinforcing that lack of engagement correlates strongly with failure.
+
+5. Scatter variability: While scatter is noticeable, the upward trend remains dominant.  Noise is expected in educational data, but the relationship is consistent and meaningful.
+
+
+Overall:
+This plot provides strong visual evidence that platform engagement — even after log transformation and winsorization — is a robust, nonlinear predictor of learning performance.
+
+#### AIC Analysis - MLR Full Variable set
+```{r FullMod}
+AIC(model_full0)
+summary(model_full0)$adj.r.squared
+sqrt(mean(residuals(model_full0)^2))
+```
+#### AIC Analysis - Best Model 
+```{r WFullMod}
+model_red6 <- lm(Wscal_score ~ code_mode + gender*disabil*finRes + high_educ + imd_band + finRes+logSum_click, data = train_data
+)
+
+AIC(model_red6)
+summary(model_red6)$adj.r.squared
+sqrt(mean(residuals(model_red6)^2))
+```
+The reduced GBM-selected model outperforms the full model across all three metrics:
+
+Lower AIC → better trade-off between fit and complexity
+
+Higher Adjusted R² → better explanatory power in scal_score that is explained by the predictors: GBM has higher value (0.5017)
+
+Lower RMSE → measures the average prediction error in the same units as `scal_score`; better prediction accuracy : agaib GBM model shines.
+
+This indicates that eliminating weak predictors improved model efficiency and performance, validating the GBM-based feature reduction approach.
+
+**Summary:** The reduced GBM provides a reasonable fit and predictive power, with moderate error and nearly half the variance explained. AIC is useful for comparing against other candidate models, such as a winsorized or interaction-based model.
+
+#### Fig.10: Marginal Effect of Click on Score
+```{r marginEffPlot, fig.height=4.5}
+
+# Prediction grid
+log_click_vals <- seq(min(df$logSum_click, na.rm = TRUE),
+                      max(df$logSum_click, na.rm = TRUE),
+                      length.out = 100)
+
+# Create newdata for prediction
+newdata <- data.frame(
+  code_mode   = factor(rep("BBB", 100), levels = levels(df$code_mode)),
+  gender      = factor(rep("F", 100), levels = levels(df$gender)),
+  disabil     = factor(rep("N", 100), levels = levels(df$disabil)),
+  high_educ   = factor(rep("HE Qual", 100), levels = levels(df$high_educ)),
+  imd_band    = factor(rep("50-60%", 100), levels = levels(df$imd_band)),
+  finRes      = factor(rep("Pass", 100), levels = levels(df$finRes)),
+  logSum_click= log_click_vals
+)
+
+# Predict using GBM
+fit <- predict(gbm_model6, newdata = newdata, n.trees = gbm_model6$n.trees)
+
+# Back-transform x-axis
+sum_click_vals <- exp(log_click_vals)
+
+# Plot predicted line
+plot(sum_click_vals, fit, type = "l",
+     xlab = "sum_click (original scale)",
+     ylab = "Predicted scal_score",
+     main = "Marginal Effect of clicks on score",
+     lwd = 2, col = "blue")
+
+```
+
+#### Prediction on New Generated Dataset (1500 records) using Model 6 (GBM)
+```{r newDataPred}
+
+set.seed(123)  # ensures reproducibility
+
+# Generate synthetic dataset (1500 rows)
+synthetic_data <- data.frame(
+  code_mode   = sample(unique(df$code_mode), 1500, replace = TRUE),
+  gender      = sample(unique(df$gender), 1500, replace = TRUE),
+  disabil     = sample(unique(df$disabil), 1500, replace = TRUE),
+  finRes      = sample(unique(df$finRes), 1500, replace = TRUE),
+  high_educ   = sample(unique(df$high_educ), 1500, replace = TRUE),
+  imd_band    = sample(unique(df$imd_band), 1500, replace = TRUE),
+  logSum_click = runif(1500, min(df$logSum_click), max(df$logSum_click))  # numeric range from original data
+)
+
+# Ensure factors match training model
+synthetic_data$code_mode <- factor(synthetic_data$code_mode, levels = levels(df$code_mode))
+synthetic_data$gender    <- factor(synthetic_data$gender,    levels = levels(df$gender))
+synthetic_data$disabil   <- factor(synthetic_data$disabil,   levels = levels(df$disabil))
+synthetic_data$finRes    <- factor(synthetic_data$finRes,    levels = levels(df$finRes))
+synthetic_data$high_educ <- factor(synthetic_data$high_educ, levels = levels(df$high_educ))
+synthetic_data$imd_band  <- factor(synthetic_data$imd_band,  levels = levels(df$imd_band))
+
+
+# Predict using correct model & dataset
+predictions <- predict(gbm_model6, newdata = synthetic_data)
+
+# Inspect results
+head(predictions)
+summary(predictions)
+```
+**Interpretation**:
+- The prediction is moderately effective—most predicted values cluster near the mean, capturing general trends, but the presence of some extreme values (outliers) and a relatively small spread of central predictions suggests limited precision for individual records. Overall, it is reasonable for group-level trends but not highly precise for single-case predictions.
+
+- Slight negative bias in predicted scores
+
+- Left-skewed distribution (more low values than high)
+
+- A reasonable spread indicating the model is responsive
+
+- Predictions falling mostly between –2 and +0.5, with some outliers
+
+#### Fig.11: Plots for Predicted Synthetic Data
+```{r}
+# Assume `synthetic_data` exists and `model_red6` is your trained GBM
+
+# 1. Generate predictions
+preds <- predict(model_red6, newdata = synthetic_data, n.trees = model_red6$n.trees)
+
+# 2. Summary statistics of predictions
+summary(preds)
+# Optional: histogram to visualize distribution
+hist(preds, breaks = 30, col = "skyblue",
+     main = "Predicted Scal_Score Distribution",
+     xlab = "Predicted scal_score")
+
+# 3. Boxplot by a categorical variable to see relative effects
+boxplot(preds ~ synthetic_data$finRes,
+        main = "Predicted Scal_Score by Pass/Fail",
+        xlab = "Pass/Fail",
+        ylab = "Predicted scal_score",
+        las = 2, col = "lightgreen")
+
+# 4. Variable importance from GBM
+if("gbm" %in% class(model_red6)){
+  var_imp <- summary(model_red6, plotit = FALSE)
+  print(var_imp)
+  
+  # Optional: barplot of variable importance
+  barplot(var_imp$rel.inf, names.arg = var_imp$var, las = 2, col = "lightcoral",
+          main = "Variable Importance in GBM", ylab = "Relative Influence")
+}
+
+# 5. Partial dependence plot for a numeric variable (e.g., logSum_click)
+if(require(gbm)){
+  gbm::plot.gbm(best_model6, i.var = "lgSm_c", n.trees = best_model6$n.trees,
+                main = "Partial Dependence of logSum_click", ylab = "Predicted scal_score")
+}
+
+```
+**HISTOGRAM**:
+Visualizes the distribution of predicted scores.
+
+Interpretation: A roughly normal, skewed, or bimodal shape indicates how the model “spreads” the predictions. For instance, clustering near higher values could indicate that the model expects many students to have higher scores under the synthetic conditions.
+
+**BOXPLOT**:
+Displays predicted score distributions for each level of finRes.
+
+Interpretation: Differences in medians or spread indicate the relative effect of this categorical variable on predicted outcomes. Higher median predicted scal_score for "Pass" vs. "Fail" reflects the model’s learned association between finRes and score.
+
+**VIF**:
+rel.inf indicates the relative influence of each predictor in the GBM.
+
+Interpretation: Variables with higher influence contribute more to model predictions; those with the largest relative influence, is the strongest predictor of scal_score in the model.
+
+
+**PARTIAL DEPENDENCY PLOT**:
+Shows the marginal effect of a predictor on predicted outcomes, holding all other variables constant.
+
+Interpretation:
+- A rising curve indicates that as logSum_click increases, predicted scal_score increases.
+
+- A flat curve indicates little or no effect.
+
+- Non-linear trends highlight interactions or diminishing returns.
+
+
+```{r bestModNames, include=FALSE}
+
+# To verify names of variables included in the best model
+best_model6$var.names
+```
+
+
+
+
+```{r fig.height=3.5, fig.width=4.5, include=FALSE, echo=FALSE}
+
+# Boxplot: predicted scaled score by code_mode
+boxplot(predictions ~ newPred_data$finRes,
+        main = "Predicted Score by finRes (Pass/Fail)",
+        xlab = "Pass/Fail",
+        ylab = "Predicted Scaled Score",
+        col = "lightgreen",
+        las = 2)  # vertical labels if needed
+
+# scatterplot for numeric predictor logSum_click
+plot(newPred_data$logSum_click, predictions,
+     main = "Predicted Scaled Score vs. logSum_click",
+     xlab = "logSum_click",
+     ylab = "Predicted Scaled Score",
+     pch = 19, col = rgb(0.2,0.4,0.6,0.6))
+abline(lm(predictions ~ newPred_data$logSum_click), col = "red", lwd = 2)
+```
+
+
+```{r summPreds, echo=FALSE}
+
+summary(predictions)
+sd(predictions)
+```
+
+
+**Interpretation**:
+* **Range:** Predictions vary from roughly **-2.29 to 1.94**, showing the model produces both negative and positive deviations relative to the centered scaled score.
+
+**Central tendency:** Median is **-0.21** and mean is **-0.22**, suggesting a slight negative bias in predictions for this synthetic dataset.
+
+**Spread:** 1st quartile is **-0.67** and 3rd quartile is **0.25**, indicating moderate variability.
+
+**Standard deviation:** About **0.68**, confirming moderate dispersion around the mean.
+
+**Summary:** The model predicts scaled scores with moderate variability and a slight negative shift, reflecting differences across the synthetic observations. The spread is reasonable for exploring relationships with predictors like `code_mode` and `logSum_click`.
+
+
+```{r modLighgbm, echo=FALSE}
+
+library(lightgbm)
+library(dplyr)
+
+set.seed(123)  # reproducibility
+
+# Prepare dataset
+df_lgb <- df %>%
+  mutate(across(c(code_mode, gender, disabil, finRes, high_educ, imd_band),
+                ~ as.integer(as.factor(.))))  # encode categorical as integers
+
+# Define target and predictors
+target <- "Wscal_score"
+predictors <- c("code_mode", "gender", "disabil", "finRes", "high_educ", "imd_band", "logSum_click")
+categorical_cols <- c("code_mode", "gender", "disabil", "finRes", "high_educ", "imd_band")
+
+# 5-fold CV setup
+k <- 5
+fold_ids <- sample(1:k, nrow(df_lgb), replace = TRUE)
+
+# Parameter grid for LightGBM
+param_grid <- expand.grid(
+  num_leaves = c(7, 15, 31),
+  learning_rate = c(0.01, 0.05, 0.1),
+  nrounds = c(300, 500, 800),
+  min_data_in_leaf = c(5, 10, 15)
+)
+
+# Initialize metrics storage
+rmse_lgb <- numeric(k)
+mae_lgb  <- numeric(k)
+r2_lgb   <- numeric(k)
+runtime_lgb <- numeric(k)
+
+# 5-fold CV loop
+for (f in 1:k) {
+  
+  train_data <- df_lgb[fold_ids != f, ]
+  val_data   <- df_lgb[fold_ids == f, ]
+  
+  best_rmse <- Inf
+  best_model <- NULL
+  start_time <- Sys.time()
+  
+  # Grid search
+  for (i in 1:nrow(param_grid)) {
+    
+    dtrain <- lgb.Dataset(
+      data = as.matrix(train_data[, predictors]),
+      label = train_data[[target]],
+      categorical_feature = categorical_cols
+    )
+    
+    dvalid <- lgb.Dataset(
+      data = as.matrix(val_data[, predictors]),
+      label = val_data[[target]],
+      categorical_feature = categorical_cols
+    )
+    
+    model_lgb <- lgb.train(
+      params = list(
+        objective = "regression",
+        metric = "rmse",
+        num_leaves = param_grid$num_leaves[i],
+        learning_rate = param_grid$learning_rate[i],
+        min_data_in_leaf = param_grid$min_data_in_leaf[i]
+      ),
+      data = dtrain,
+      nrounds = param_grid$nrounds[i],
+      valids = list(val = dvalid),
+      verbose = -1,
+      early_stopping_rounds = 20
+    )
+    
+    preds <- predict(model_lgb, as.matrix(val_data[, predictors]))
+    rmse_fold <- sqrt(mean((val_data[[target]] - preds)^2))
+    
+    if (rmse_fold < best_rmse) {
+      best_rmse <- rmse_fold
+      best_model <- model_lgb
+    }
+  }
+  
+  end_time <- Sys.time()
+  runtime_lgb[f] <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Final predictions & metrics
+  # Final predictions & metrics
+  final_preds <- predict(best_model, as.matrix(val_data[, predictors]))
+  rmse_lgb[f] <- sqrt(mean((val_data[[target]] - final_preds)^2))
+  mae_lgb[f]  <- mean(abs(val_data[[target]] - final_preds))
+  ss_total <- sum((val_data[[target]] - mean(val_data[[target]]))^2)
+  ss_res   <- sum((val_data[[target]] - final_preds)^2)
+  r2_lgb[f] <- ifelse(ss_total == 0, 0, 1 - ss_res/ss_total)
+}
+
+# Summarize CV results
+  lightgbm_summary <- data.frame(
+  Mean_RMSE = round(mean(rmse_lgb), 4),
+  SD_RMSE   = round(sd(rmse_lgb), 4),
+  Mean_MAE  = round(mean(mae_lgb), 4),
+  SD_MAE    = round(sd(mae_lgb), 4),
+  Mean_R2   = round(mean(r2_lgb), 4),
+  SD_R2     = round(sd(r2_lgb), 4),
+  Avg_Runtime = round(mean(runtime_lgb), 2)
+)
+ 
+  print(lightgbm_summary)
+```
+**Comparative Analysis to GBM (Model 6)**
+
+- The predictive performance of LightGBM is very similar to GBM, with a tiny edge in RMSE stability and slightly lower MAE.
+
+-  LightGBM efficiently handles categorical features natively, which might provide more consistent results and better scaling for larger datasets.
+
+-  Overall, both models are comparable in predictive power, but LightGBM offers a more modern, computationally efficient implementation for potential future extensions.
+
+#### LightGBM Feature Importance
+```{r lightGbmFeatImp, echo=FALSE}
+
+library(lightgbm)
+library(ggplot2)
+library(dplyr)
+
+# Assuming `best_model` is your trained LightGBM model from CV
+# Get feature importance
+importance <- lgb.importance(best_model, percentage = TRUE)
+
+# Convert to tibble for plotting
+importance_df <- as_tibble(importance)
+
+# Plot feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LightGBM Feature Importance",
+       x = "Feature",
+       y = "Relative Importance (Gain)")
+
+```
+
+#### Data Revisit Dataset to Remove Unneeded Columns
+```{r finalDtaset, include=FALSE}
+
+Final_df <- df
+
+target_var <- "Wscal_score"   # Target variable
+
+# Predictor variables from reduced winsorized model
+predictors <- c("code_mode", "high_educ", "imd_band", "logSum_click",
+              "disabil", "finRes") 
+
+# Optional predictors
+optional_vars <- c("age_band", "prev_attempts", "logStudy_credits", "LMS_group", "reduceReg")
+
+# Combine all essential variables
+essential_vars <- c(target_var, predictors, optional_vars)
+
+# Subset dataset
+Final_df <- Final_df[, intersect(names(Final_df), essential_vars)]
+
+# Verify
+str(Final_df)         # Structure of cleaned dataset
+summary(Final_df)     # Summary statistics
+names(Final_df)       # Column names to confirm only essential variables remain
+
+# Remove rows with missing target
+Final_df <- Final_df[!is.na(Final_df[[target_var]]), ]
+```
+
+
+#### Output Final Clean Dataset
+```{r writeOutFile, include=FALSE}
+output_file <- "proj_finData.csv"
+
+if (!file.exists(output_file)) {
+  write.csv(Final_df, output_file, row.names = FALSE)
+  message("File written successfully.")
+} else {
+  write.csv(Final_df, output_file, row.names = FALSE)
+  message("File already existed, but is being overwritten.")
+}
+```
+
+**Clean Dataset**: Contains clean dataset,  Consists of all variables, the full set that the original data set contained but values have now been cleaned by methodss described above.
+
+#### Output Final PREDICTION Dataset
+```{r writeOutFile, include=FALSE}
+
+output_file <- "proj_predData.csv"
+
+if (!file.exists(output_file)) {
+  write.csv(Predict_df, output_file, row.names = FALSE)
+  message("File written successfully.")
+} else {
+  write.csv(Predict_df, output_file, row.names = FALSE)
+  message("File already existed, but is being overwritten.")
+}
+```
+
+** Predictive Modeling Dataset**: Contains only the variables who lend statistical support to predicting students' scores.  When used in the best models, either additively or interactively with each other, they resulted in the highest predictive modeling power.  
